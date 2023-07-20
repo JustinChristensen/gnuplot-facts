@@ -1,0 +1,149 @@
+#!/usr/bin/env node
+
+const { readFileSync, writeFileSync, statSync } = require('fs')
+const { join } = require('path')
+
+const genScript = (title, data) => `
+set term qt 0 font "Verdana,7" size 1280,640
+unset key
+set autoscale x noextend
+set xtics format "%Y" nomirror
+set ytics format "$%.0f" nomirror
+set xdata time
+set grid 
+iso_fmt = "%Y-%m-%d"
+set timefmt iso_fmt
+mid(s, e) = s + (e - s) / 2
+threemo=8035200
+sixmo=16070400
+ninemo=24105600
+rank(d) = d < threemo ? 1 : d < sixmo ? 2 : d < ninemo ? 3 : 4
+set title "${title}" font ",10"
+plot "-" using (mid(timecolumn(2, iso_fmt), timecolumn(3, iso_fmt))):1:2:3:(rank(timecolumn(3, iso_fmt) - timecolumn(2, iso_fmt))) with xerrorbars linecolor variable pointtype 0
+${data}`.trimStart()
+
+const stale = file => {
+    try {
+        const { mtime } = statSync(file)
+        const weekAgo = new Date(Number(mtime) - 604800000)
+        return mtime < weekAgo
+    } catch (_) {}
+    return true
+}
+
+const fetchFacts = async (cik, cikFile) => {
+    console.error('facts stale, fetching...')
+
+    return fetch(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`, {
+        headers: {
+            Accept: 'application/json',
+            'Accept-Encoding': 'gzip, deflate',
+            'User-Agent': process.env.EDGAR_UA
+        }
+    }).then(async (resp) => {
+        const body = await resp.text()
+
+        if (!resp.ok) {
+            throw new Error(`request for facts failed\n${resp.status} ${resp.statusText}\n${body}`)
+        }
+
+        writeFileSync(cikFile, body, 'utf8')
+        return body
+    })
+}
+
+const getFacts = async (cik) => {
+    const cikFile = join(process.env.HOME, `.facts/${cik}.json`)
+    const facts = !stale(cikFile) ? readFileSync(cikFile, 'utf8') : await fetchFacts(cik, cikFile)
+    return JSON.parse(facts)
+}
+
+const usage = (status = 0) => {
+    console.error('usage: plotfacts <cik> <concept>')
+    process.exit(status)
+}
+
+const threshold = diff => {
+    if (diff < 93) return 1
+    if (diff < 186) return 2
+    if (diff < 279) return 3
+    return 4
+}
+
+const diffDays = (y, x) => {
+    if (!x) return 0
+    const time = y.getTime() - x.getTime()
+    return time / (24 * 60 * 60 * 1000)
+}
+
+const allowedUnits = ["USD", "USD/shares"]
+
+const formatAsData = (concept, rank) => {
+    const unit = allowedUnits.find(u => concept?.units?.[u])
+
+    const facts = concept?.units?.[unit]?.reduce((facts, fact) => {
+        const { end, filed, fp } = fact
+
+        const e = new Date(end)
+
+        if (!fact.start) {
+            const t = new Date(e)
+            t.setUTCDate(1)
+            const m = fp === 'FY' || !fp ? 11 : 2
+            t.setUTCMonth(t.getUTCMonth() - m)
+            fact.start = t.toISOString().split('T')[0]
+        }
+
+        const s = new Date(fact.start)
+        const k = `${end}${fact.start}`
+        const v = facts[k]
+
+        fact.rank = threshold(diffDays(e, s))
+
+        if (!v || v.filed < filed) facts[k] = fact
+
+        return facts
+    }, {})
+
+    const sortedFacts = Object.values(facts).filter(f => {
+        if (!rank) return true
+        return f.rank == rank
+    }).sort((f1, f2) => {
+        const t = f1.rank - f2.rank
+        if (t !== 0) return t
+        return new Date(f1.end) - new Date(f2.end)
+    })
+
+    return sortedFacts.map(({ start, end, val }) => `${val} ${start} ${end}`)?.join('\n')
+}
+
+const main = async () => {
+    const [,,cik, conceptPat, rank] = process.argv
+    if (!cik || !conceptPat) usage(1)
+
+    const conceptRe = new RegExp(conceptPat, 'i')
+    const { entityName, facts } = await getFacts(cik.padStart(10, '0'))
+    const concepts = facts?.["us-gaap"]
+    const selected = Object.keys(concepts).sort().filter(c => {
+        if (!allowedUnits.some(u => concepts[c].units[u])) return false
+        return conceptRe.test(c)
+    })
+
+    if (selected.length > 1) {
+        selected.forEach(s => console.log(s))
+        return 
+    }
+
+    if (!selected.length) {
+        console.error('error: no concepts found')
+        usage(1)
+    }
+
+    const concept = concepts[selected[0]]
+    const title = `${entityName} - ${concept.label}`
+    const data = formatAsData(concept, rank)
+
+    console.log(genScript(title, data))
+}
+
+main()
