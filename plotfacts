@@ -22,44 +22,54 @@ set title "${title}" font ",10"
 plot "-" using (mid(timecolumn(2, iso_fmt), timecolumn(3, iso_fmt))):1:2:3:(rank(timecolumn(3, iso_fmt) - timecolumn(2, iso_fmt))) with xerrorbars linecolor variable pointtype 0
 ${data}`.trimStart()
 
+const ONE_WEEK = 7 * 24 * 60 * 60 * 1000
+
 const stale = file => {
     try {
         const { mtime } = statSync(file)
-        const weekAgo = new Date(Number(mtime) - 604800000)
+        const weekAgo = new Date(Number(mtime) - ONE_WEEK)
         return mtime < weekAgo
     } catch (_) {}
     return true
 }
 
-const fetchFacts = async (cik, cikFile) => {
+const fetchEdgar = (url, options) => fetch(url, {
+    ...options,
+    headers: {
+        Accept: 'application/json',
+        'Accept-Encoding': 'gzip, deflate',
+        'User-Agent': process.env.EDGAR_UA,
+        ...options
+    }
+}).then(async resp => {
+    const body = await resp.text()
+
+    if (!resp.ok) {
+        throw new Error(`request failed\nGET ${url}\n${resp.status} ${resp.statusText}\n${body}`)
+    }
+
+    return body
+})
+
+const fetchFacts = async cik => {
     console.error('facts stale, fetching...')
-
-    return fetch(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`, {
-        headers: {
-            Accept: 'application/json',
-            'Accept-Encoding': 'gzip, deflate',
-            'User-Agent': process.env.EDGAR_UA
-        }
-    }).then(async (resp) => {
-        const body = await resp.text()
-
-        if (!resp.ok) {
-            throw new Error(`request for facts failed\n${resp.status} ${resp.statusText}\n${body}`)
-        }
-
-        writeFileSync(cikFile, body, 'utf8')
-        return body
-    })
+    return fetchEdgar(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`)
 }
 
-const getFacts = async (cik) => {
-    const cikFile = join(process.env.HOME, `.facts/${cik}.json`)
-    const facts = !stale(cikFile) ? readFileSync(cikFile, 'utf8') : await fetchFacts(cik, cikFile)
-    return JSON.parse(facts)
+const getOrCache = async (file, fn) => {
+    if (!stale(file)) return readFileSync(file, 'utf8')
+    const result = await fn()
+    writeFileSync(file, result, 'utf8')
+    return result
 }
+
+const factspath = path => join(process.env.HOME, '.facts', path)
+
+const getFacts = async (cik) => 
+    JSON.parse(await getOrCache(factspath(`${cik}.json`), () => fetchFacts(cik)))
 
 const usage = (status = 0) => {
-    console.error('usage: plotfacts <cik> <concept>')
+    console.error('usage: plotfacts <cikOrName> <concept>')
     process.exit(status)
 }
 
@@ -117,12 +127,53 @@ const formatAsData = (concept, rank) => {
     return sortedFacts.map(({ start, end, val }) => `${val} ${start} ${end}`)?.join('\n')
 }
 
-const main = async () => {
-    const [,,cik, conceptPat, rank] = process.argv
-    if (!cik || !conceptPat) usage(1)
+const fetchCompanyTickers = () => {
+    console.error('company tickers stale, fetching...')
+    return fetchEdgar('https://www.sec.gov/files/company_tickers.json')
+}
 
-    const conceptRe = new RegExp(conceptPat, 'i')
+const getCompanyTickers = async () => 
+    JSON.parse(await getOrCache(factspath(`company_tickers.json`), fetchCompanyTickers))
+
+const findCik = async cikOrNamePattern => {
+    if (/^\d+$/.test(cikOrNamePattern)) return cikOrNamePattern
+
+    const companies = Object.values(await getCompanyTickers())
+    const cik = companies.find(({ ticker }) => ticker === cikOrNamePattern)?.cik_str?.toString()
+
+    if (cik) return cik
+
+    const nameRe = new RegExp(cikOrNamePattern, 'i')
+    const filtered = companies.filter(({ title }) => nameRe.test(title))
+
+    if (filtered.length === 1) return filtered[0].cik_str?.toString()
+    else if (filtered.length > 1) {
+        filtered.forEach(company => console.log(company.title))
+        return process.exit(0)
+    } else {
+        console.error('error: no companies found')
+        return usage(1)
+    }
+}
+
+const main = async () => {
+    const [,, cikOrNamePattern, conceptPattern, rank] = process.argv
+    const cik = await findCik(cikOrNamePattern)
+
+    if (!cik) {
+        console.error('error: missing cik or name pattern')
+        usage(1)
+    }
+
+    if (!conceptPattern) {
+        console.error('error: missing concept pattern')
+        usage(1)
+    }
+
+    const conceptRe = new RegExp(conceptPattern, 'i')
+
     const { entityName, facts } = await getFacts(cik.padStart(10, '0'))
+
     const concepts = facts?.["us-gaap"]
     const selected = Object.keys(concepts).sort().filter(c => {
         if (!allowedUnits.some(u => concepts[c].units[u])) return false
